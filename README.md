@@ -17,20 +17,26 @@ JobLedger lets each registered user manage their own job applications as they pr
 # 1. Copy environment variables
 cp .env.example .env
 
-# 2. Build and start all services
-docker-compose up --build
+# 2. Build and start all services in detached mode
+docker compose up -d --build
 
-# 3. Run database migrations (first time only)
-docker-compose exec backend flask db upgrade
+# 3. Initialize database migrations (first time only)
+docker compose exec backend flask db init
+docker compose exec backend flask db migrate -m "Initial migration"
+docker compose exec backend flask db upgrade
+
+# 4. Seed database with sample data (optional)
+# This will create 3 users with 10 applications each.
+docker compose exec backend python seed.py
 ```
 
-- **Backend API**: http://localhost:5000
-- **Frontend**: http://localhost:3000
+- **Frontend App**: http://localhost:3000
+- **Backend API**: http://localhost:5001 *(Note: Changed from 5000 to prevent macOS AirPlay Receiver port conflicts)*
 
 ### Running Tests
 
 ```bash
-docker-compose exec backend pytest -v
+docker compose exec backend pytest -v
 ```
 
 ---
