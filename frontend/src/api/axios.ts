@@ -16,7 +16,8 @@ apiClient.interceptors.request.use((config) => {
 apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401) {
+    const isLoginPage = window.location.pathname === '/login' || window.location.pathname === '/register'
+    if (error.response?.status === 401 && !isLoginPage) {
       localStorage.removeItem('access_token')
       window.location.href = '/login'
     }
