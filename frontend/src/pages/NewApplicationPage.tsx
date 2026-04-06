@@ -49,8 +49,8 @@ export default function NewApplicationPage() {
     }
   }
 
-  const Field = ({ id, label, required = false }: { id: string; label: string; required?: boolean }) => (
-    <div>
+  const renderField = (id: string, label: string, required = false) => (
+    <div key={id}>
       <label htmlFor={id} className="label">{label}{required && <span className="text-red-500 ml-0.5">*</span>}</label>
       <input id={id} value={form[id as keyof typeof form]} onChange={set(id)} className="input" required={required} />
       {errors[id] && <p className="form-error">{errors[id]}</p>}
@@ -75,12 +75,12 @@ export default function NewApplicationPage() {
 
           <form onSubmit={handleSubmit} id="new-application-form" className="space-y-5">
             <div className="grid sm:grid-cols-2 gap-4">
-              <Field id="company_name" label="Company name" required />
-              <Field id="role_title" label="Role / Job title" required />
+              {renderField("company_name", "Company name", true)}
+              {renderField("role_title", "Role / Job title", true)}
             </div>
-            <Field id="job_url" label="Job posting URL" />
+            {renderField("job_url", "Job posting URL")}
             <div className="grid sm:grid-cols-2 gap-4">
-              <Field id="location" label="Location" />
+              {renderField("location", "Location")}
               <div>
                 <label htmlFor="applied_date" className="label">Applied date</label>
                 <input id="applied_date" type="date" value={form.applied_date} onChange={set('applied_date')}
