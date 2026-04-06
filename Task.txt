@@ -1,0 +1,667 @@
+================================================================================
+PROJECT: Job Application Tracker
+AGENT INSTRUCTIONS — Full Build Specification
+================================================================================
+
+You are building a production-quality "Job Application Tracker" web application.
+This is an assessment submission. Prioritize correctness, structure, and
+simplicity over feature count. Every decision should be intentional and
+explainable. Read this entire file before writing any code.
+
+================================================================================
+SECTION 1: TECH STACK
+================================================================================
+
+Backend:
+  - Language:     Python 3.12+
+  - Framework:    Flask (with Flask-RESTful or plain Flask blueprints)
+  - ORM:          SQLAlchemy (Flask-SQLAlchemy)
+  - Migrations:   Flask-Migrate (Alembic)
+  - Auth:         Flask-JWT-Extended (JWT access tokens)
+  - Validation:   Marshmallow (Flask-Marshmallow) for schema validation
+  - Password:     Werkzeug password hashing (bcrypt)
+  - Testing:      pytest + pytest-flask
+
+Frontend:
+  - Framework:    React 18 (Vite)
+  - Language:     Typescript
+  - HTTP Client:  Axios
+  - Routing:      React Router v6
+  - State:        React Context API (no Redux — keep it simple)
+  - Styling:      TailwindCSS
+
+Database:
+  - Engine:       PostgreSQL 17
+
+Infrastructure:
+  - Docker + Docker Compose (all services containerized)
+  - Services: backend, frontend, db
+
+================================================================================
+SECTION 2: SYSTEM OVERVIEW
+================================================================================
+
+A single-user-per-account job application tracker. Each registered user manages
+only their own applications. There is no admin role.
+
+Core entities:
+  - User          (authentication + ownership)
+  - Application   (a job they applied to)
+  - Note          (timestamped notes attached to an application)
+
+The most critical business rule is the APPLICATION STATE MACHINE.
+Applications move through stages in a defined, enforced order.
+No stage can be skipped or reversed (except explicit rejection from any stage).
+
+================================================================================
+SECTION 3: APPLICATION STATE MACHINE (CRITICAL — ENFORCE THIS STRICTLY)
+================================================================================
+
+Valid Stages (in order):
+  1. APPLIED
+  2. SCREENING
+  3. INTERVIEW
+  4. OFFER
+  5. REJECTED  (terminal — reachable from ANY stage)
+  6. WITHDRAWN (terminal — reachable from ANY stage, user withdrew themselves)
+
+Transition Rules:
+  - APPLIED      → SCREENING, REJECTED, WITHDRAWN
+  - SCREENING    → INTERVIEW, REJECTED, WITHDRAWN
+  - INTERVIEW    → OFFER, REJECTED, WITHDRAWN
+  - OFFER        → REJECTED, WITHDRAWN (edge case: offer rescinded)
+  - REJECTED     → (no further transitions — terminal)
+  - WITHDRAWN    → (no further transitions — terminal)
+
+Implementation requirement:
+  - Define these transitions as a constant dictionary/map in the backend.
+  - The stage update endpoint MUST validate against this map.
+  - Return HTTP 422 with a descriptive error if an invalid transition is attempted.
+  - Never trust the frontend to enforce this — backend is the single source of truth.
+
+Example enforcement (Python pseudocode):
+  VALID_TRANSITIONS = {
+      "APPLIED":    ["SCREENING", "REJECTED", "WITHDRAWN"],
+      "SCREENING":  ["INTERVIEW", "REJECTED", "WITHDRAWN"],
+      "INTERVIEW":  ["OFFER", "REJECTED", "WITHDRAWN"],
+      "OFFER":      ["REJECTED", "WITHDRAWN"],
+      "REJECTED":   [],
+      "WITHDRAWN":  [],
+  }
+
+================================================================================
+SECTION 4: DATABASE SCHEMA
+================================================================================
+
+Table: users
+  - id            UUID, primary key, default gen_random_uuid()
+  - email         VARCHAR(255), unique, not null
+  - password_hash VARCHAR(255), not null
+  - full_name     VARCHAR(100), not null
+  - created_at    TIMESTAMP, default now()
+
+Table: applications
+  - id            UUID, primary key
+  - user_id       UUID, foreign key → users.id, on delete CASCADE
+  - company_name  VARCHAR(150), not null
+  - role_title    VARCHAR(150), not null
+  - job_url       TEXT, nullable
+  - location      VARCHAR(150), nullable
+  - salary_min    INTEGER, nullable (in local currency, no decimals)
+  - salary_max    INTEGER, nullable
+  - stage         VARCHAR(20), not null, default 'APPLIED'
+                  CHECK stage IN ('APPLIED','SCREENING','INTERVIEW','OFFER','REJECTED','WITHDRAWN')
+  - applied_date  DATE, not null, default today
+  - created_at    TIMESTAMP, default now()
+  - updated_at    TIMESTAMP, default now(), auto-update on change
+
+Table: notes
+  - id            UUID, primary key
+  - application_id UUID, foreign key → applications.id, on delete CASCADE
+  - user_id       UUID, foreign key → users.id, on delete CASCADE
+  - content       TEXT, not null
+  - created_at    TIMESTAMP, default now()
+
+Indexes:
+  - applications(user_id)
+  - applications(user_id, stage)
+  - notes(application_id)
+
+Constraints:
+  - salary_min must be <= salary_max if both provided (enforce in app layer)
+  - content of notes must not be empty/whitespace only
+  - applied_date cannot be in the future
+
+================================================================================
+SECTION 5: BACKEND API SPECIFICATION
+================================================================================
+
+All endpoints return JSON.
+All protected endpoints require: Authorization: Bearer <access_token>
+All error responses follow this shape:
+  { "error": "message describing the problem" }
+
+All success responses for lists:
+  { "data": [...], "total": N }
+
+All success responses for single items:
+  { "data": { ... } }
+
+--------------------------------------
+AUTH ENDPOINTS (no auth required)
+--------------------------------------
+
+POST /api/auth/register
+  Request:  { email, password, full_name }
+  Response: 201 { data: { id, email, full_name, created_at } }
+  Errors:
+    - 400 if any field missing or invalid format
+    - 409 if email already registered
+  Validation:
+    - email must be valid format
+    - password minimum 8 characters
+    - full_name minimum 2 characters, no special chars
+
+POST /api/auth/login
+  Request:  { email, password }
+  Response: 200 { data: { access_token, user: { id, email, full_name } } }
+  Errors:
+    - 401 if credentials invalid (use same message for both — no enumeration)
+
+GET /api/auth/me
+  Auth required.
+  Response: 200 { data: { id, email, full_name, created_at } }
+
+--------------------------------------
+APPLICATION ENDPOINTS (auth required)
+--------------------------------------
+
+GET /api/applications
+  Query params:
+    - stage (optional, filter by stage)
+    - search (optional, matches company_name or role_title, case-insensitive)
+    - sort_by (optional: applied_date | updated_at | company_name, default: updated_at)
+    - order (optional: asc | desc, default: desc)
+  Response: 200 { data: [...applications], total: N }
+  Rules:
+    - Only return applications belonging to the authenticated user.
+
+POST /api/applications
+  Request:
+    {
+      company_name,   required
+      role_title,     required
+      job_url,        optional
+      location,       optional
+      salary_min,     optional integer
+      salary_max,     optional integer
+      applied_date    optional, ISO date string, defaults to today
+    }
+  Response: 201 { data: { ...application } }
+  Errors:
+    - 400 on missing required fields or invalid data
+    - 422 on business rule violation (salary_min > salary_max, future applied_date)
+
+GET /api/applications/:id
+  Response: 200 { data: { ...application, notes: [...] } }
+  Errors:
+    - 404 if not found or not owned by user
+
+PATCH /api/applications/:id
+  Allowed fields to update:
+    company_name, role_title, job_url, location, salary_min, salary_max, applied_date
+  NOTE: stage is NOT updated through this endpoint.
+  Response: 200 { data: { ...application } }
+  Errors:
+    - 400 on invalid data
+    - 404 if not found or not owned by user
+
+PATCH /api/applications/:id/stage
+  Request:  { stage: "SCREENING" }
+  Response: 200 { data: { ...application } }
+  Errors:
+    - 422 if transition is invalid (include message listing valid next stages)
+    - 404 if not found or not owned by user
+
+DELETE /api/applications/:id
+  Response: 204 No Content
+  Errors:
+    - 404 if not found or not owned by user
+
+--------------------------------------
+NOTES ENDPOINTS (auth required)
+--------------------------------------
+
+GET /api/applications/:id/notes
+  Response: 200 { data: [...notes], total: N }
+  Errors:
+    - 404 if application not found or not owned by user
+
+POST /api/applications/:id/notes
+  Request:  { content }
+  Response: 201 { data: { id, application_id, content, created_at } }
+  Errors:
+    - 400 if content is empty or whitespace only
+    - 404 if application not found or not owned by user
+
+DELETE /api/applications/:id/notes/:note_id
+  Response: 204 No Content
+  Errors:
+    - 404 if note or application not found or not owned by user
+
+--------------------------------------
+DASHBOARD ENDPOINT (auth required)
+--------------------------------------
+
+GET /api/dashboard
+  Response:
+    {
+      "data": {
+        "total": N,
+        "by_stage": {
+          "APPLIED": N,
+          "SCREENING": N,
+          "INTERVIEW": N,
+          "OFFER": N,
+          "REJECTED": N,
+          "WITHDRAWN": N
+        },
+        "recent_activity": [ last 5 updated applications ]
+      }
+    }
+
+================================================================================
+SECTION 6: FRONTEND STRUCTURE & PAGES
+================================================================================
+
+Directory structure:
+  src/
+    api/           axios instance + all API call functions
+    components/    reusable UI components (Button, Badge, Modal, etc.)
+    context/       AuthContext (stores user + token)
+    pages/         one file per route
+    utils/         helpers (date formatting, stage colors, etc.)
+    App.tsx        router setup
+    main.tsx       entry point
+
+Pages:
+  /login               LoginPage
+  /register            RegisterPage
+  /dashboard           DashboardPage  (protected)
+  /applications        ApplicationsListPage (protected)
+  /applications/new    NewApplicationPage (protected)
+  /applications/:id    ApplicationDetailPage (protected)
+
+Protected Route:
+  - Create a PrivateRoute component that checks AuthContext.
+  - If no token, redirect to /login.
+
+AuthContext:
+  - Stores: user object, access_token
+  - Persists token to localStorage
+  - Provides: login(), logout(), isAuthenticated
+  - On app load, verify token with GET /api/auth/me
+
+--------------------------------------
+PAGE DESCRIPTIONS
+--------------------------------------
+
+DashboardPage:
+  - Summary cards: total apps, by each stage
+  - Recent activity list (last 5 updated)
+
+ApplicationsListPage:
+  - Table/card list of all applications
+  - Filter by stage (tab or dropdown)
+  - Search by company or role
+  - Each row shows: company, role, stage badge (color-coded), applied date
+  - Click → goes to ApplicationDetailPage
+
+NewApplicationPage:
+  - Form to create a new application
+  - Fields: company, role, job URL, location, salary range, applied date
+  - Validates before submit
+  - On success, redirect to the new application's detail page
+
+ApplicationDetailPage:
+  - Shows all application fields
+  - Stage transition buttons — only show VALID next stages from current stage
+  - Edit mode (inline or modal) for updating fields
+  - Notes section at bottom: list of notes + add new note form
+  - Delete application button (with confirmation)
+
+Stage badge colors (consistent across all pages):
+  APPLIED    → Blue
+  SCREENING  → Yellow / Amber
+  INTERVIEW  → Purple
+  OFFER      → Green
+  REJECTED   → Red
+  WITHDRAWN  → Gray
+
+================================================================================
+SECTION 7: FOLDER / PROJECT STRUCTURE
+================================================================================
+
+job-tracker/
+  docker-compose.yml
+  .env.example
+  README.md
+  CLAUDE.md                     ← AI guidance file (see Section 10)
+
+  backend/
+    Dockerfile
+    requirements.txt
+    .env.example
+    run.py                      ← app entry point
+    app/
+      __init__.py               ← create_app() factory
+      config.py                 ← config classes (Dev, Test, Prod)
+      extensions.py             ← db, migrate, jwt, ma instances
+      models/
+        __init__.py
+        user.py
+        application.py
+        note.py
+      schemas/
+        __init__.py
+        user_schema.py
+        application_schema.py
+        note_schema.py
+      routes/
+        __init__.py
+        auth.py
+        applications.py
+        notes.py
+        dashboard.py
+      services/
+        __init__.py
+        auth_service.py
+        application_service.py  ← state machine logic lives here
+        note_service.py
+      utils/
+        errors.py               ← custom error handlers
+        decorators.py           ← ownership check helpers
+      tests/
+        __init__.py
+        conftest.py
+        test_auth.py
+        test_applications.py
+        test_stage_transitions.py
+        test_notes.py
+
+  frontend/
+    Dockerfile
+    package.json
+    vite.config.ts
+    tailwind.config.js
+    index.html
+    src/
+      api/
+        axios.ts
+        auth.ts
+        applications.ts
+        notes.ts
+        dashboard.ts
+      components/
+        PrivateRoute.tsx
+        Navbar.tsx
+        StageBadge.tsx
+        StageTransitionButtons.tsx
+        ApplicationCard.tsx
+        NoteItem.tsx
+        ConfirmModal.tsx
+        LoadingSpinner.tsx
+      context/
+        AuthContext.tsx
+      pages/
+        LoginPage.tsx
+        RegisterPage.tsx
+        DashboardPage.tsx
+        ApplicationsListPage.tsx
+        NewApplicationPage.tsx
+        ApplicationDetailPage.tsx
+      utils/
+        formatDate.ts
+        stageConfig.ts          ← stage colors, labels, valid transitions
+      App.tsx
+      main.tsx
+
+================================================================================
+SECTION 8: DOCKER SETUP
+================================================================================
+
+docker-compose.yml must define 3 services:
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: jobtracker
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: 5432:5432
+    volumes: postgres_data:/var/lib/postgresql/data
+    healthcheck: pg_isready
+
+  backend:
+    build: ./backend
+    ports: 5000:5000
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/jobtracker
+      JWT_SECRET_KEY: dev-secret-change-in-prod
+      FLASK_ENV: development
+    depends_on: db (with condition: service_healthy)
+    volumes: ./backend:/app  (for hot reload in dev)
+    command: flask run --host=0.0.0.0 --port=5000
+
+  frontend:
+    build: ./frontend
+    ports: 3000:3000
+    environment:
+      VITE_API_URL: http://localhost:5000/api
+    depends_on: backend
+    volumes: ./frontend:/app, /app/node_modules
+    command: npm run dev -- --host
+
+backend/Dockerfile:
+  FROM python:3.12-slim
+  WORKDIR /app
+  COPY requirements.txt .
+  RUN pip install --no-cache-dir -r requirements.txt
+  COPY . .
+  CMD ["flask", "run", "--host=0.0.0.0"]
+
+frontend/Dockerfile:
+  FROM node:22-alpine
+  WORKDIR /app
+  COPY package*.json .
+  RUN npm install
+  COPY . .
+  CMD ["npm", "run", "dev", "--", "--host"]
+
+.env.example (root):
+  POSTGRES_DB=jobtracker
+  POSTGRES_USER=postgres
+  POSTGRES_PASSWORD=postgres
+  JWT_SECRET_KEY=change-this-in-production
+  FLASK_ENV=development
+  VITE_API_URL=http://localhost:5000/api
+
+Startup instructions (to be in README):
+  1. cp .env.example .env
+  2. docker-compose up --build
+  3. docker-compose exec backend flask db upgrade
+  Backend runs at: http://localhost:5000
+  Frontend runs at: http://localhost:3000
+
+================================================================================
+SECTION 9: TESTING REQUIREMENTS
+================================================================================
+
+Framework: pytest + pytest-flask
+Use a separate in-memory SQLite DB for tests (configured in conftest.py).
+
+Required test files and what they must cover:
+
+test_auth.py:
+  - Register with valid data → 201
+  - Register with duplicate email → 409
+  - Register with missing fields → 400
+  - Register with weak password → 400
+  - Login with valid credentials → 200 + token returned
+  - Login with wrong password → 401
+  - Login with non-existent email → 401 (same message as wrong password)
+  - GET /me without token → 401
+  - GET /me with valid token → 200
+
+test_applications.py:
+  - Create application with valid data → 201
+  - Create application missing required fields → 400
+  - Create application with salary_min > salary_max → 422
+  - Create application with future applied_date → 422
+  - List applications returns only current user's apps (not another user's)
+  - Get application by ID → 200
+  - Get another user's application → 404
+  - Update application fields → 200
+  - Delete application → 204
+  - Delete another user's application → 404
+
+test_stage_transitions.py:
+  - APPLIED → SCREENING is valid
+  - APPLIED → INTERVIEW is invalid → 422
+  - APPLIED → REJECTED is valid
+  - APPLIED → WITHDRAWN is valid
+  - SCREENING → INTERVIEW is valid
+  - SCREENING → APPLIED is invalid → 422
+  - INTERVIEW → OFFER is valid
+  - OFFER → REJECTED is valid
+  - REJECTED → anything is invalid → 422
+  - WITHDRAWN → anything is invalid → 422
+  (This is the most important test file — cover all edge cases)
+
+test_notes.py:
+  - Add note to own application → 201
+  - Add note to another user's application → 404
+  - Add empty note → 400
+  - Add whitespace-only note → 400
+  - Delete note → 204
+  - Delete note from another user's application → 404
+
+================================================================================
+SECTION 10: CLAUDE.MD (AI GUIDANCE FILE)
+================================================================================
+
+Create a file called CLAUDE.md in the project root with the following content:
+
+---
+# CLAUDE.md — AI Agent Guidance for Job Application Tracker
+
+## Purpose
+This file defines rules and constraints for AI agents working on this codebase.
+These rules protect system integrity and must never be violated.
+
+## Non-Negotiable Rules
+
+### State Machine
+- The VALID_TRANSITIONS map in application_service.py is the single source of truth.
+- Never add a new stage without updating VALID_TRANSITIONS.
+- Never bypass transition validation — not even in tests.
+- Stage changes must ONLY go through the /stage endpoint, never through PATCH /applications/:id.
+
+### Ownership
+- Every data-fetching query on applications and notes MUST filter by user_id.
+- Never return data without confirming it belongs to the authenticated user.
+- Ownership check must live in the service layer, not just the route.
+
+### Validation
+- All input validation must use Marshmallow schemas.
+- Never manually parse or trust raw request data without schema validation.
+- Schema files are in app/schemas/ — do not inline validation logic in routes.
+
+### Tests
+- Every new endpoint must have at least one corresponding test.
+- Stage transition tests must be updated when transitions change.
+- Never delete existing tests — fix them instead.
+
+### No Clever Code
+- Prefer readable, explicit code over clever one-liners.
+- No dynamic attribute access (getattr with string) unless unavoidable.
+- No global state outside of Flask extensions.
+
+## Conventions
+- Routes only handle HTTP concerns (parse input, call service, return response).
+- Services handle all business logic.
+- Models are plain SQLAlchemy models — no business logic in models.
+- UUIDs for all primary keys — no integer IDs.
+- All datetimes stored as UTC.
+
+## Adding Features
+Before adding a feature:
+1. Identify which service file it belongs in.
+2. Check if a new schema is needed.
+3. Write the test first (TDD preferred).
+4. Do not modify the state machine without explicit instruction.
+
+## What Not To Do
+- Do not add new libraries without checking if existing ones cover the need.
+- Do not expose stack traces in API error responses.
+- Do not store plaintext passwords anywhere, ever.
+- Do not add CORS wildcard (*) in production config.
+---
+
+================================================================================
+SECTION 11: ERROR HANDLING STANDARDS
+================================================================================
+
+- Never return raw exception messages to the client.
+- Use a centralized error handler registered in create_app().
+- HTTP status codes must be semantically correct:
+    200 OK, 201 Created, 204 No Content
+    400 Bad Request (invalid input format)
+    401 Unauthorized (missing or invalid token)
+    403 Forbidden (authenticated but not allowed)
+    404 Not Found (resource doesn't exist or not owned)
+    409 Conflict (duplicate email)
+    422 Unprocessable Entity (business rule violation)
+    500 Internal Server Error (unexpected — log it, return generic message)
+
+- Log all 5xx errors with enough context to diagnose (but never log passwords).
+- Marshmallow validation errors → 400 with field-level error messages.
+- JWT errors → 401 with message "Authentication required."
+
+================================================================================
+SECTION 12: WHAT NOT TO BUILD (SCOPE LIMITS)
+================================================================================
+
+Do NOT build:
+  - Email notifications
+  - File/resume uploads
+  - Admin panel or multiple user roles
+  - OAuth / social login
+  - Pagination (keep it simple — return all results with total count)
+  - Dark mode toggle
+  - Kanban drag-and-drop board (a list/table is sufficient)
+  - Any external API integration
+
+These would add complexity without improving evaluation score.
+
+================================================================================
+SECTION 13: README REQUIREMENTS
+================================================================================
+
+The README.md must include:
+
+1. Project Overview (2-3 sentences)
+2. Setup Instructions (Docker Compose steps)
+3. Key Technical Decisions:
+   - Why state machine is in a service layer, not the model
+   - Why Marshmallow for validation
+   - Why UUID primary keys
+   - Why single role (no admin)
+4. Architecture Overview (brief — backend/frontend/db responsibilities)
+5. Running Tests (`docker-compose exec backend pytest`)
+6. Known Limitations / Tradeoffs
+7. How to extend (e.g., "to add email notifications, you would...")
+
+================================================================================
+END OF AGENT INSTRUCTIONS
+================================================================================
